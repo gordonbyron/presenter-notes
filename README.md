@@ -1,5 +1,7 @@
 # Presenter Notes
 
+<img src="Resources/AppIcon.png" width="128" alt="Presenter Notes icon: a large Aa on a dark blue square with a yellow line under it">
+
 A small Mac app that shows your speaker notes in very large print and keeps them in step with a Google Slides slideshow.
 
 I am visually impaired and could not read the speaker notes that slideshow tools put under the slide. This app puts the notes on their own screen, in text as large as you need, and changes the note when the slide changes.
@@ -161,6 +163,10 @@ The app writes a short log to `~/Library/Logs/PresenterNotes.log`. It holds slid
 ```
 
 This runs the built-in checks, prints the results, writes a picture of each screen to the folder, and quits. The clicks and key presses in the self-test are simulated inside the app. The one real event it sends is a scroll of zero distance, to confirm the mouse watcher receives events.
+
+## Icon
+
+The icon is drawn by a script, so it can be changed without a drawing app. `tools/make_icon.sh` redraws it and rebuilds `Resources/AppIcon.icns`. Pass `lines` for the alternative design.
 
 ## Code
 
