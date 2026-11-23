@@ -1547,7 +1547,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(sizes)
         menu.addItem(.separator())
 
-        menu.addItem(menuItem("Mouse control", checked: Settings.mouseControl && MouseControl.shared.isRunning) { [unowned self] in
+        menu.addItem(menuItem("Mouse control", checked: Settings.mouseControl) { [unowned self] in
             run(kVK_ANSI_K)
         })
         menu.addItem(menuItem("Follow slides", checked: Settings.followSlides) { [unowned self] in run(kVK_ANSI_F) })
@@ -1704,6 +1704,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     static let mousePermissionText = "To use the mouse, Presenter Notes needs permission.\n\nOpen System Settings, then Privacy & Security, then Accessibility. Turn on Presenter Notes.\n\nPress Ctrl+Opt+N to hide your notes while you do this. Then press Ctrl+Opt+K to switch the mouse on."
 
+    /// The app watches the mouse only while presenting. It runs all day in the menu bar,
+    /// and has no business looking at mouse events the rest of the time.
+    private func updateMouseWatcher() {
+        guard !CommandLine.arguments.contains("--snapshot") else { return } // the self-test starts it by hand
+        if visible, Settings.mouseControl {
+            if !MouseControl.shared.start() { Log.write("mouse watching could not start") }
+        } else {
+            MouseControl.shared.stop()
+        }
+    }
+
     private func setMouseControl(_ on: Bool, announce: Bool) {
         guard on else {
             Settings.mouseControl = false
@@ -1719,7 +1730,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let trusted = AXIsProcessTrustedWithOptions(
             [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: announce] as CFDictionary)
         Log.write("mouse control requested: accessibility permission \(trusted)")
-        guard trusted, MouseControl.shared.start() else {
+        guard trusted else {
             Log.write("mouse control could not start")
             Settings.mouseControl = false
             if announce {
@@ -1729,6 +1740,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         Settings.mouseControl = true
+        updateMouseWatcher()
         Log.write("mouse control is on")
         if announce {
             showBriefly("Mouse control is ON.\n\nIn a full-screen slideshow: left click goes forward, right click goes back, the wheel scrolls your notes.",
@@ -1890,6 +1902,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if !Settings.mouseControl {
             lines.append("Mouse control: off")
+        } else if !visible {
+            lines.append("Mouse control: on. It starts when you present")
         } else if !MouseControl.shared.isRunning {
             lines.append("Mouse control: on, but not allowed by macOS")
         } else {
@@ -2264,6 +2278,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             contextualHotKeys.removeAll()
             panel.orderOut(nil)
         }
+        updateMouseWatcher()
     }
 
     private func refresh() {

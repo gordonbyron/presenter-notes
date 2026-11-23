@@ -5,7 +5,8 @@ cd "$(dirname "$0")"
 
 APP="build/Presenter Notes.app"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
 swiftc -O -swift-version 5 Sources/main.swift -o "$APP/Contents/MacOS/PresenterNotes"
 
@@ -18,6 +19,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleDisplayName</key><string>Presenter Notes</string>
     <key>CFBundleIdentifier</key><string>com.gbyron.presenter-notes</string>
     <key>CFBundleExecutable</key><string>PresenterNotes</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>1.0</string>
     <key>CFBundleVersion</key><string>1</string>
