@@ -28,6 +28,7 @@ enum Settings {
     @Stored(key: "notesPath", fallback: "") static var notesPath: String
     @Stored(key: "followSlides", fallback: true) static var followSlides: Bool
     @Stored(key: "mouseControl", fallback: true) static var mouseControl: Bool
+    @Stored(key: "editorFontSize", fallback: 26.0) static var editorFontSize: Double
 }
 
 let textColours: [(name: String, colour: NSColor)] = [
@@ -115,8 +116,25 @@ final class NotesStore {
             createSampleIfMissing()
         } else {
             url = URL(fileURLWithPath: Settings.notesPath)
+            if !FileManager.default.fileExists(atPath: url.path) {
+                // The set in use was deleted or moved. Fall back to another set, or to a fresh sample.
+                url = NotesStore.anyFile(near: url) ?? NotesStore.defaultURL
+                Settings.notesPath = url.path
+                createSampleIfMissing()
+            }
         }
         load()
+    }
+
+    /// Another notes file to use when one goes missing: from the same folder, then the notes folder.
+    static func anyFile(near missing: URL) -> URL? {
+        for folder in [missing.deletingLastPathComponent(), defaultURL.deletingLastPathComponent()] {
+            let files = ((try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? [])
+                .filter { $0.pathExtension.lowercased() == "txt" && $0.standardizedFileURL.path != missing.standardizedFileURL.path }
+                .sorted { $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending }
+            if let first = files.first { return first }
+        }
+        return nil
     }
 
     private func createSampleIfMissing() {
@@ -467,6 +485,7 @@ final class MouseControl {
         guard let port = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
                                            eventsOfInterest: mask, callback: { _, type, event, _ in
             if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                Log.write("macOS paused mouse watching (\(type == .tapDisabledByTimeout ? "the app answered too slowly" : "user input")). Switching it back on")
                 if let port = MouseControl.shared.tap { CGEvent.tapEnable(tap: port, enable: true) }
                 return Unmanaged.passUnretained(event)
             }
@@ -708,30 +727,615 @@ struct Command {
     let run: () -> Void
 }
 
+// MARK: - Editing notes
+
+/// Text changes made by the notes window. Kept apart from the window so they can be tested.
+enum NotesEditing {
+    static func deckLink(_ deckID: String) -> String { "https://docs.google.com/presentation/d/\(deckID)/edit" }
+
+    /// A file for a new set of notes, with a name that is free in the folder.
+    static func newFileURL(named name: String, in folder: URL) -> URL {
+        var base = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        for bad in ["/", ":", "\\"] { base = base.replacingOccurrences(of: bad, with: "-") }
+        if base.lowercased().hasSuffix(".txt") { base = String(base.dropLast(4)) }
+        if base.isEmpty { base = "Notes" }
+        var url = folder.appendingPathComponent(base + ".txt")
+        var number = 2
+        while FileManager.default.fileExists(atPath: url.path) {
+            url = folder.appendingPathComponent("\(base) \(number).txt")
+            number += 1
+        }
+        return url
+    }
+
+    /// What a new set starts with. If a deck is showing in the browser, the set is linked to it.
+    static func starterText(deckID: String?, slideID: String?) -> String {
+        guard let deckID else {
+            return "Type the note for your first slide here.\n---\nType the note for your second slide here.\n"
+        }
+        var text = "deck: \(deckLink(deckID))\n\n"
+        if let slideID { text += "slide: \(slideID)\n" }
+        return text + "Type the note for this slide here.\n"
+    }
+
+    /// Adds a note tied to a slide, or finds the note that slide already has.
+    /// `cursor` is where typing should continue, or nil when nothing was changed or found.
+    static func addNote(to text: String, deckID: String, slideID: String) -> (text: String, cursor: Int?, status: String) {
+        let (fileDeck, pages) = NotesStore.parse(text)
+        if let fileDeck, fileDeck != deckID {
+            return (text, nil, "These notes are linked to a different slide deck, so nothing was added.")
+        }
+        if pages.contains(where: { $0.slideID == slideID }) {
+            // Put the cursor on the line after that slide's `slide:` line.
+            var offset = 0
+            for line in text.components(separatedBy: "\n") {
+                let length = (line as NSString).length + 1
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                if trimmed.lowercased().hasPrefix("slide:"),
+                   NotesStore.slideID(from: String(trimmed.dropFirst(6)).trimmingCharacters(in: .whitespaces)) == slideID {
+                    return (text, min(offset + length, (text as NSString).length), "This slide already has a note. The cursor is on it.")
+                }
+                offset += length
+            }
+        }
+        let hasNotes = pages.contains { !$0.text.isEmpty || $0.slideID != nil }
+        var result = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if fileDeck == nil { result = "deck: \(deckLink(deckID))" + (result.isEmpty ? "" : "\n\n" + result) }
+        result += hasNotes ? "\n---\n" : "\n\n"
+        result += "slide: \(slideID)\n"
+        return (result, (result as NSString).length, "Added a note for the slide on screen. Type the note.")
+    }
+
+    /// One line describing a set, for the list.
+    static func summary(of text: String) -> String {
+        let (deck, pages) = NotesStore.parse(text)
+        let count = pages.filter { !$0.text.isEmpty || $0.slideID != nil }.count
+        let linked = pages.filter { $0.slideID != nil }.count
+        let notes = count == 1 ? "1 note" : "\(count) notes"
+        if deck == nil { return "\(notes), not linked to a deck" }
+        return linked == count ? "\(notes), linked to a deck" : "\(notes), \(linked) linked to slides"
+    }
+}
+
+/// A button drawn by the app itself: a solid colour with large white text.
+/// System buttons vary with the appearance setting and can be low in contrast.
+final class ClosureButton: NSButton {
+    private var handler: () -> Void = {}
+    private var textSize: CGFloat = 18
+    private var bold = false
+    /// The button's colour. Blue marks the main action.
+    var fill = NSColor(white: 0.36, alpha: 1) { didSet { needsDisplay = true } }
+
+    convenience init(_ title: String, size: CGFloat = 18, bold: Bool = false, handler: @escaping () -> Void) {
+        self.init(title: title, target: nil, action: nil)
+        self.handler = handler
+        self.textSize = size
+        self.bold = bold
+        target = self
+        action = #selector(fire)
+        isBordered = false
+        translatesAutoresizingMaskIntoConstraints = false
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+    }
+
+    private var label: NSAttributedString {
+        NSAttributedString(string: title, attributes: [
+            .font: NSFont.systemFont(ofSize: textSize, weight: bold ? .bold : .semibold),
+            .foregroundColor: NSColor.white,
+        ])
+    }
+
+    override var intrinsicContentSize: NSSize {
+        let size = label.size()
+        return NSSize(width: ceil(size.width) + textSize * 2, height: ceil(size.height) + textSize * 0.9)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let colour = isHighlighted ? (fill.blended(withFraction: 0.35, of: .black) ?? fill) : fill
+        colour.setFill()
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 9, yRadius: 9).fill()
+        let size = label.size()
+        label.draw(at: NSPoint(x: (bounds.width - size.width) / 2, y: (bounds.height - size.height) / 2))
+    }
+
+    @objc private func fire() { handler() }
+}
+
+/// A sheet with large text, for the questions the notes window asks.
+enum LargeSheet {
+    static func ask(in window: NSWindow, title: String, message: String, field: String? = nil,
+                    actionTitle: String, completion: @escaping (_ answer: String?) -> Void) {
+        let sheet = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 100), styleMask: [.titled],
+                             backing: .buffered, defer: false)
+        let titleLabel = NSTextField(wrappingLabelWithString: title)
+        titleLabel.font = .systemFont(ofSize: 24, weight: .bold)
+        let messageLabel = NSTextField(wrappingLabelWithString: message)
+        messageLabel.font = .systemFont(ofSize: 19)
+        var input: NSTextField?
+        if let field {
+            let text = NSTextField(string: field)
+            text.font = .systemFont(ofSize: 24)
+            text.setAccessibilityLabel(title)
+            input = text
+        }
+        func finish(_ answer: String?) {
+            window.endSheet(sheet)
+            completion(answer)
+        }
+        let cancel = ClosureButton("Cancel", size: 19) { finish(nil) }
+        cancel.keyEquivalent = "\u{1b}"
+        let action = ClosureButton(actionTitle, size: 19, bold: true) { finish(input?.stringValue ?? "") }
+        action.fill = actionTitle == "Delete" ? .systemRed : .systemBlue
+        action.keyEquivalent = "\r"
+        let buttons = NSStackView(views: [cancel, action])
+        buttons.spacing = 14
+        let stack = NSStackView(views: [titleLabel, messageLabel] + (input.map { [$0] } ?? []) + [buttons])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 16
+        stack.edgeInsets = NSEdgeInsets(top: 24, left: 26, bottom: 22, right: 26)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        let content = NSView()
+        content.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: content.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            content.widthAnchor.constraint(equalToConstant: 620),
+        ])
+        input?.widthAnchor.constraint(equalToConstant: 560).isActive = true
+        sheet.contentView = content
+        sheet.initialFirstResponder = input
+        window.beginSheet(sheet)
+    }
+}
+
+/// A list row whose selection is a solid blue bar, whether or not the list has keyboard focus.
+final class BoldRowView: NSTableRowView {
+    override var isEmphasized: Bool {
+        get { true }
+        set {}
+    }
+
+    override func drawSelection(in dirtyRect: NSRect) {
+        NSColor.systemBlue.setFill()
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 4, dy: 2), xRadius: 8, yRadius: 8).fill()
+    }
+}
+
+/// The notes window: a list of sets of notes, a large-print editor, and the Present button.
+final class LibraryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate, NSTextViewDelegate {
+    let window: NSWindow
+    let folder: URL
+    /// Start presenting with this set.
+    var onPresent: (URL) -> Void = { _ in }
+    var onClose: () -> Void = {}
+    /// A set was moved to the Trash.
+    var onDelete: (URL) -> Void = { _ in }
+    /// The slide showing in the browser right now, if the app can see one.
+    var slideOnScreen: () -> SlideFollower.Position? = { nil }
+
+    private(set) var files: [URL] = []
+    private(set) var editing: URL?
+    private var dirty = false
+    private var loadedDate: Date?
+    private var saveTimer: Timer?
+    private var watchTimer: Timer?
+    private let table = NSTableView()
+    private var textView: NSTextView!
+    private let nameLabel = NSTextField(labelWithString: "")
+    private let status = NSTextField(wrappingLabelWithString: "")
+    static let tip = "A line of three dashes (---) starts the next note. Your changes save as you type."
+
+    init(folder: URL) {
+        self.folder = folder
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1180, height: 780),
+                          styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        super.init()
+        window.title = "Presenter Notes"
+        window.isReleasedWhenClosed = false
+        window.minSize = NSSize(width: 940, height: 560)
+        window.delegate = self
+        buildContent()
+        window.center()
+        window.setFrameAutosaveName("PresenterNotesLibrary")
+    }
+
+    // MARK: Layout
+
+    private func buildContent() {
+        let listTitle = NSTextField(labelWithString: "Your sets of notes")
+        listTitle.font = .systemFont(ofSize: 22, weight: .bold)
+
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("set"))
+        column.resizingMask = .autoresizingMask
+        table.addTableColumn(column)
+        table.headerView = nil
+        table.rowHeight = 64
+        table.style = .inset
+        table.dataSource = self
+        table.delegate = self
+        table.allowsEmptySelection = false
+        table.setAccessibilityLabel("Sets of notes")
+        let listScroll = NSScrollView()
+        listScroll.documentView = table
+        listScroll.hasVerticalScroller = true
+        listScroll.borderType = .bezelBorder
+
+        let newButton = ClosureButton("New set") { [unowned self] in newSet() }
+        let deleteButton = ClosureButton("Delete") { [unowned self] in deleteSet() }
+        let listButtons = NSStackView(views: [newButton, deleteButton])
+        listButtons.spacing = 10
+
+        nameLabel.font = .systemFont(ofSize: 24, weight: .bold)
+        nameLabel.lineBreakMode = .byTruncatingTail
+        nameLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let presentButton = ClosureButton("Present", size: 22, bold: true) { [unowned self] in present() }
+        presentButton.fill = .systemBlue
+        presentButton.setAccessibilityLabel("Present")
+        let header = NSStackView(views: [nameLabel, NSView(), presentButton])
+        header.spacing = 12
+
+        let addButton = ClosureButton("Add a note for the slide on screen") { [unowned self] in addNoteForSlide() }
+        let smaller = ClosureButton("Smaller text") { [unowned self] in resizeEditor(by: -2) }
+        let bigger = ClosureButton("Bigger text") { [unowned self] in resizeEditor(by: 2) }
+        let tools = NSStackView(views: [addButton, NSView(), smaller, bigger])
+        tools.spacing = 10
+
+        let editorScroll = NSTextView.scrollableTextView()
+        editorScroll.borderType = .bezelBorder
+        textView = (editorScroll.documentView as! NSTextView)
+        textView.delegate = self
+        textView.isRichText = false
+        textView.allowsUndo = true
+        textView.usesFindBar = true
+        textView.textContainerInset = NSSize(width: 14, height: 14)
+        // Smart dashes would turn the three dashes that separate notes into a long dash.
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticTextReplacementEnabled = false
+        textView.isAutomaticSpellingCorrectionEnabled = false
+        textView.setAccessibilityLabel("Notes text")
+        applyEditorFont()
+
+        status.font = .systemFont(ofSize: 19)
+        status.textColor = .secondaryLabelColor
+        status.stringValue = LibraryWindowController.tip
+        status.maximumNumberOfLines = 2
+
+        let left = NSStackView(views: [listTitle, listScroll, listButtons])
+        left.orientation = .vertical
+        left.alignment = .leading
+        left.spacing = 12
+        let right = NSStackView(views: [header, tools, editorScroll, status])
+        right.orientation = .vertical
+        right.alignment = .leading
+        right.spacing = 12
+        let root = NSStackView(views: [left, right])
+        root.orientation = .horizontal
+        root.alignment = .top
+        root.spacing = 20
+        root.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 18, right: 20)
+        root.translatesAutoresizingMaskIntoConstraints = false
+
+        let content = NSView()
+        content.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            root.topAnchor.constraint(equalTo: content.topAnchor),
+            root.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            left.widthAnchor.constraint(equalToConstant: 330),
+            right.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            left.heightAnchor.constraint(equalTo: root.heightAnchor, constant: -38),
+            right.heightAnchor.constraint(equalTo: root.heightAnchor, constant: -38),
+            listScroll.widthAnchor.constraint(equalTo: left.widthAnchor),
+            header.widthAnchor.constraint(equalTo: right.widthAnchor),
+            tools.widthAnchor.constraint(equalTo: right.widthAnchor),
+            editorScroll.widthAnchor.constraint(equalTo: right.widthAnchor),
+            status.widthAnchor.constraint(equalTo: right.widthAnchor),
+        ])
+        listScroll.setContentHuggingPriority(.defaultLow, for: .vertical)
+        editorScroll.setContentHuggingPriority(.defaultLow, for: .vertical)
+        window.contentView = content
+    }
+
+    private func applyEditorFont() {
+        textView.font = .systemFont(ofSize: CGFloat(Settings.editorFontSize))
+    }
+
+    private func resizeEditor(by delta: Double) {
+        Settings.editorFontSize = min(max(Settings.editorFontSize + delta, 14), 72)
+        applyEditorFont()
+        say("Editor text size \(Int(Settings.editorFontSize)).")
+    }
+
+    private func say(_ text: String) { status.stringValue = text }
+
+    // MARK: Showing and closing
+
+    func show(selecting url: URL? = nil) {
+        reloadFiles()
+        select(url ?? editing ?? files.first)
+        window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(textView)
+        if watchTimer == nil {
+            watchTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in self?.checkDisk() }
+        }
+    }
+
+    func close() {
+        saveIfNeeded()
+        window.orderOut(nil)
+        stopWatching()
+        onClose()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        saveIfNeeded()
+        stopWatching()
+        onClose()
+    }
+
+    private func stopWatching() {
+        watchTimer?.invalidate()
+        watchTimer = nil
+    }
+
+    // MARK: The list
+
+    func reloadFiles() {
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let found = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
+        files = found.filter { $0.pathExtension.lowercased() == "txt" }
+            .sorted { $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending }
+        table.reloadData()
+    }
+
+    private func index(of url: URL?) -> Int? {
+        guard let url else { return nil }
+        return files.firstIndex { $0.standardizedFileURL.path == url.standardizedFileURL.path }
+    }
+
+    func select(_ url: URL?) {
+        guard let row = index(of: url) else {
+            editing = nil
+            nameLabel.stringValue = "No notes yet. Press New set."
+            textView.string = ""
+            textView.isEditable = false
+            return
+        }
+        if table.selectedRow != row { table.selectRowIndexes([row], byExtendingSelection: false) }
+        load(files[row])
+    }
+
+    private func load(_ url: URL) {
+        if editing?.standardizedFileURL.path != url.standardizedFileURL.path { saveIfNeeded() }
+        editing = url
+        textView.isEditable = true
+        textView.string = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        textView.undoManager?.removeAllActions()
+        loadedDate = modified(url)
+        dirty = false
+        nameLabel.stringValue = url.deletingPathExtension().lastPathComponent
+        say(LibraryWindowController.tip)
+    }
+
+    private func modified(_ url: URL) -> Date? {
+        (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { files.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let url = files[row]
+        let text = (url.standardizedFileURL.path == editing?.standardizedFileURL.path)
+            ? textView.string : ((try? String(contentsOf: url, encoding: .utf8)) ?? "")
+        let label = NSTextField(labelWithString: "")
+        let title = NSMutableAttributedString(string: url.deletingPathExtension().lastPathComponent + "\n",
+                                              attributes: [.font: NSFont.systemFont(ofSize: 21, weight: .semibold)])
+        title.append(NSAttributedString(string: NotesEditing.summary(of: text),
+                                        attributes: [.font: NSFont.systemFont(ofSize: 16)]))
+        label.attributedStringValue = title
+        label.maximumNumberOfLines = 2
+        label.lineBreakMode = .byTruncatingTail
+        label.translatesAutoresizingMaskIntoConstraints = false
+        let cell = NSTableCellView()
+        cell.addSubview(label)
+        cell.textField = label // lets the text turn white on the blue selection bar
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 6),
+            label.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
+            label.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+        ])
+        return cell
+    }
+
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? { BoldRowView() }
+
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        let row = table.selectedRow
+        guard row >= 0, row < files.count else { return }
+        if files[row].standardizedFileURL.path != editing?.standardizedFileURL.path { load(files[row]) }
+    }
+
+    // MARK: Saving
+
+    func textDidChange(_ notification: Notification) {
+        dirty = true
+        saveTimer?.invalidate()
+        saveTimer = Timer.scheduledTimer(withTimeInterval: 0.7, repeats: false) { [weak self] _ in self?.saveIfNeeded() }
+    }
+
+    func saveIfNeeded() {
+        saveTimer?.invalidate()
+        guard dirty, let url = editing else { return }
+        do {
+            try textView.string.write(to: url, atomically: true, encoding: .utf8)
+            loadedDate = modified(url)
+            dirty = false
+            if let row = index(of: url) { table.reloadData(forRowIndexes: [row], columnIndexes: [0]) }
+        } catch {
+            say("Could not save: \(error.localizedDescription)")
+        }
+    }
+
+    /// Picks up files changed or added outside the window, such as notes written by the Claude skill.
+    private func checkDisk() {
+        let found = ((try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.pathExtension.lowercased() == "txt" }
+        if Set(found.map(\.lastPathComponent)) != Set(files.map(\.lastPathComponent)) {
+            let keep = editing
+            reloadFiles()
+            if let row = index(of: keep) { table.selectRowIndexes([row], byExtendingSelection: false) } else { select(files.first) }
+        }
+        if let url = editing, !dirty, let date = modified(url), date != loadedDate {
+            let place = textView.selectedRange()
+            textView.string = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+            loadedDate = date
+            let length = (textView.string as NSString).length
+            textView.setSelectedRange(NSRange(location: min(place.location, length), length: 0))
+            if let row = index(of: url) { table.reloadData(forRowIndexes: [row], columnIndexes: [0]) }
+            say("These notes changed on disk and were loaded again.")
+        }
+    }
+
+    // MARK: Actions
+
+    func newSet() {
+        LargeSheet.ask(in: window, title: "New set of notes",
+                       message: "Give it a name, such as the name of the slideshow.",
+                       field: "", actionTitle: "Create") { [weak self] answer in
+            guard let self, let answer else { return }
+            _ = self.createSet(named: answer)
+        }
+    }
+
+    @discardableResult
+    func createSet(named name: String) -> URL? {
+        saveIfNeeded()
+        let url = NotesEditing.newFileURL(named: name, in: folder)
+        let position = slideOnScreen()
+        do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try NotesEditing.starterText(deckID: position?.deckID, slideID: position?.slideID)
+                .write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            say("Could not create the notes: \(error.localizedDescription)")
+            return nil
+        }
+        reloadFiles()
+        select(url)
+        window.makeFirstResponder(textView)
+        textView.selectAll(nil)
+        say(position == nil
+            ? "New set created. It is not linked to a slide deck yet."
+            : "New set created and linked to the slide deck showing in your browser.")
+        return url
+    }
+
+    func deleteSet() {
+        guard let url = editing else { return }
+        let name = url.deletingPathExtension().lastPathComponent
+        LargeSheet.ask(in: window, title: "Delete \u{201C}\(name)\u{201D}?",
+                       message: "The notes move to the Trash, so you can get them back from there.",
+                       actionTitle: "Delete") { [weak self] answer in
+            guard let self, answer != nil else { return }
+            self.dirty = false
+            do {
+                try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+            } catch {
+                self.say("Could not delete: \(error.localizedDescription)")
+                return
+            }
+            self.editing = nil
+            self.reloadFiles()
+            self.select(self.files.first)
+            self.onDelete(url)
+            self.say("\u{201C}\(name)\u{201D} moved to the Trash.")
+        }
+    }
+
+    func addNoteForSlide() {
+        guard editing != nil else { return }
+        guard let position = slideOnScreen(), let slideID = position.slideID else {
+            say("No slide found. Open your slide deck in Chrome, click a slide, then press this button again.")
+            return
+        }
+        let result = NotesEditing.addNote(to: textView.string, deckID: position.deckID, slideID: slideID)
+        if result.text != textView.string {
+            let whole = NSRange(location: 0, length: (textView.string as NSString).length)
+            if textView.shouldChangeText(in: whole, replacementString: result.text) {
+                textView.textStorage?.replaceCharacters(in: whole, with: result.text)
+                textView.didChangeText()
+            }
+        }
+        if let cursor = result.cursor {
+            textView.setSelectedRange(NSRange(location: cursor, length: 0))
+            textView.scrollRangeToVisible(NSRange(location: cursor, length: 0))
+            window.makeFirstResponder(textView)
+        }
+        say(result.status)
+    }
+
+    func present() {
+        saveIfNeeded()
+        guard let url = editing else {
+            say("Create a set of notes first.")
+            return
+        }
+        onPresent(url)
+    }
+
+    func biggerText() { resizeEditor(by: 2) }
+    func smallerText() { resizeEditor(by: -2) }
+}
+
 final class ClosureMenuItem: NSMenuItem {
     private let handler: () -> Void
-    init(title: String, handler: @escaping () -> Void) {
+    init(title: String, key: String = "", handler: @escaping () -> Void) {
         self.handler = handler
-        super.init(title: title, action: #selector(fire), keyEquivalent: "")
+        super.init(title: title, action: #selector(fire), keyEquivalent: key)
         target = self
     }
     required init(coder: NSCoder) { fatalError("not used") }
     @objc private func fire() { handler() }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let store = NotesStore()
     private let view = OverlayView()
     private var panel: OverlayPanel!
     private var statusItem: NSStatusItem!
     private var commands: [Command] = []
     private var contextualHotKeys: [UInt32] = []
-    private var visible = !CommandLine.arguments.contains("--hidden")
+    /// True while presenting, which is when the notes screen is showing.
+    /// The app starts in the notes window. `--present` starts presenting straight away.
+    private var visible = CommandLine.arguments.contains("--present") || CommandLine.arguments.contains("--snapshot")
+    private var library: LibraryWindowController!
+    private var sharingChecked = false
     private var showingHelp = false
     private var message: (text: String, colour: NSColor)?
+    private var messageTimer: Timer?
+
+    /// Shows a message that clears itself. Used for confirmations that need no action,
+    /// so someone using only the menu and the mouse is never left behind a message.
+    private func showBriefly(_ text: String, colour: NSColor, seconds: TimeInterval) {
+        message = (text, colour)
+        refresh()
+        messageTimer?.invalidate()
+        messageTimer = Timer.scheduledTimer(withTimeInterval: seconds, repeats: false) { [weak self] _ in
+            guard let self, self.message?.text == text else { return }
+            self.message = nil
+            self.refresh()
+        }
+    }
     private var blockedShortcuts: [String] = []
     private let follower = SlideFollower()
     private var lastPosition: SlideFollower.Position?
+    private var lastDeckSeen: String?
     /// True when the slide on screen has no note linked to it.
     private var noNoteForSlide = false
     private var pageIndex = Settings.pageIndex
@@ -746,7 +1350,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.hasShadow = false
         panel.ignoresMouseEvents = true // clicks go through to the slides
         panel.hidesOnDeactivate = false
-        panel.level = .screenSaver // above a full-screen slideshow
+        // Above every app window, including a full-screen slideshow, and just below the menu bar,
+        // so the menu bar item stays reachable on the screen that shows the notes.
+        panel.level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue - 1)
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         panel.sharingType = capturable ? .readOnly : .none // .none keeps it out of screen sharing
         panel.contentView = view
@@ -787,13 +1393,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.follower.poll()
         }
 
+        library = LibraryWindowController(folder: NotesStore.defaultURL.deletingLastPathComponent())
+        library.onPresent = { [unowned self] url in present(url) }
+        library.onClose = { NSApp.setActivationPolicy(.accessory) } // back to a menu bar app with no Dock icon
+        library.slideOnScreen = { [unowned self] in lastPosition }
+        library.onDelete = { [unowned self] url in notesFileDeleted(url) }
+        buildMainMenu()
+
         applyVisibility()
         refresh()
 
         if let flag = CommandLine.arguments.firstIndex(of: "--snapshot"), CommandLine.arguments.count > flag + 1 {
             writeSnapshots(to: CommandLine.arguments[flag + 1])
-        } else {
-            checkSharing(announce: false)
+        } else if visible {
+            startedPresenting()
+        } else if !CommandLine.arguments.contains("--hidden") {
+            openLibrary()
         }
     }
 
@@ -801,8 +1416,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func buildCommands() {
         commands = [
-            Command(title: "Show or hide notes", keys: "Ctrl+Opt+N", keyCode: kVK_ANSI_N, always: true) { [unowned self] in
-                visible.toggle(); showingHelp = false; applyVisibility(); refresh()
+            Command(title: "Start or stop presenting", keys: "Ctrl+Opt+N", keyCode: kVK_ANSI_N, always: true) { [unowned self] in
+                if visible { stopPresenting() } else { present(store.url) }
             },
             Command(title: "Next note", keys: "Ctrl+Opt+Right", keyCode: kVK_RightArrow) { [unowned self] in turn(by: 1) },
             Command(title: "Previous note", keys: "Ctrl+Opt+Left", keyCode: kVK_LeftArrow) { [unowned self] in turn(by: -1) },
@@ -827,8 +1442,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 refresh()
                 view.flash(count > 1 ? "Display \(Settings.screenIndex + 1) of \(count)" : "Only one display")
             },
-            Command(title: "Edit the notes file", keys: "Ctrl+Opt+E", keyCode: kVK_ANSI_E) { [unowned self] in
-                NSWorkspace.shared.open(store.url)
+            Command(title: "Edit notes", keys: "Ctrl+Opt+E", keyCode: kVK_ANSI_E) { [unowned self] in
+                openLibrary(selecting: store.url)
             },
             Command(title: "Open another notes file", keys: "Ctrl+Opt+O", keyCode: kVK_ANSI_O) { [unowned self] in chooseFile() },
             Command(title: "Follow slides on or off", keys: "Ctrl+Opt+F", keyCode: kVK_ANSI_F) { [unowned self] in
@@ -878,15 +1493,209 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         command.run()
     }
 
+    // MARK: Menu bar
+
+    static let menuFont = NSFont.menuFont(ofSize: 18) // larger than the system menu text
+    static let textSizes: [Double] = [48, 64, 84, 100, 120, 140, 160, 200, 240]
+
     private func buildMenu() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.title = "Notes"
-        let menu = NSMenu()
-        for command in commands {
-            if command.keyCode == kVK_ANSI_Q { menu.addItem(.separator()) }
-            menu.addItem(ClosureMenuItem(title: "\(command.title)    \(command.keys)") { [unowned self] in perform(command) })
+        if let button = statusItem.button {
+            button.image = NSImage(systemSymbolName: "note.text", accessibilityDescription: "Presenter Notes")
+            button.imagePosition = .imageLeading
+            button.title = " Notes"
         }
+        let menu = NSMenu()
+        menu.delegate = self
+        menu.autoenablesItems = false
         statusItem.menu = menu
+    }
+
+    private func menuItem(_ title: String, checked: Bool = false, _ action: (() -> Void)? = nil) -> NSMenuItem {
+        let item: NSMenuItem = action.map { ClosureMenuItem(title: title, handler: $0) }
+            ?? NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.attributedTitle = NSAttributedString(string: title, attributes: [.font: AppDelegate.menuFont])
+        item.state = checked ? .on : .off
+        item.isEnabled = action != nil
+        return item
+    }
+
+    private func run(_ keyCode: Int) {
+        if let command = commands.first(where: { $0.keyCode == keyCode }) { perform(command) }
+    }
+
+    /// The menu is rebuilt each time it opens, so it always shows the current state.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        menu.addItem(menuItem(visible ? "Stop presenting" : "Present") { [unowned self] in run(kVK_ANSI_N) })
+        menu.addItem(menuItem("Edit notes…") { [unowned self] in openLibrary(selecting: store.url) })
+        menu.addItem(.separator())
+
+        menu.addItem(menuItem("Bigger text") { [unowned self] in run(kVK_ANSI_Equal) })
+        menu.addItem(menuItem("Smaller text") { [unowned self] in run(kVK_ANSI_Minus) })
+        let sizes = menuItem("Text size: \(Int(Settings.fontSize))") {}
+        let sizeMenu = NSMenu()
+        sizeMenu.autoenablesItems = false
+        for size in AppDelegate.textSizes {
+            sizeMenu.addItem(menuItem("\(Int(size))", checked: Int(size) == Int(Settings.fontSize)) { [unowned self] in
+                Settings.fontSize = size
+                refresh()
+                view.flash("Text size \(Int(size))")
+            })
+        }
+        sizes.submenu = sizeMenu
+        menu.addItem(sizes)
+        menu.addItem(.separator())
+
+        menu.addItem(menuItem("Mouse control", checked: Settings.mouseControl && MouseControl.shared.isRunning) { [unowned self] in
+            run(kVK_ANSI_K)
+        })
+        menu.addItem(menuItem("Follow slides", checked: Settings.followSlides) { [unowned self] in run(kVK_ANSI_F) })
+        menu.addItem(.separator())
+
+        menu.addItem(menuItem("Notes for this slideshow:"))
+        let current = store.url.standardizedFileURL.path
+        for file in notesFiles() {
+            let name = file.deletingPathExtension().lastPathComponent
+            menu.addItem(menuItem("    " + name, checked: file.standardizedFileURL.path == current) { [unowned self] in
+                selectFile(file)
+                if library.window.isVisible { library.select(file) }
+            })
+        }
+        menu.addItem(menuItem("Choose another file…") { [unowned self] in run(kVK_ANSI_O) })
+        menu.addItem(menuItem("Open the notes folder") { [unowned self] in
+            NSWorkspace.shared.open(store.url.deletingLastPathComponent())
+        })
+        menu.addItem(.separator())
+
+        menu.addItem(menuItem("Move notes to the next display") { [unowned self] in run(kVK_ANSI_M) })
+        menu.addItem(menuItem("Show shortcuts") { [unowned self] in run(kVK_ANSI_H) })
+        menu.addItem(menuItem("Show status") { [unowned self] in run(kVK_ANSI_I) })
+        menu.addItem(.separator())
+        menu.addItem(menuItem("Quit Presenter Notes") { NSApp.terminate(nil) })
+    }
+
+    // MARK: Present mode and the notes window
+
+    /// Opens the notes window. Presenting stops, because the notes screen would cover the window.
+    private func openLibrary(selecting url: URL? = nil) {
+        if visible { stopPresenting() }
+        NSApp.setActivationPolicy(.regular) // a normal app while the window is open: Dock icon, menus, Cmd+Tab
+        library.show(selecting: url ?? store.url)
+        NSApp.activate(ignoringOtherApps: true)
+        Log.write("notes window opened")
+    }
+
+    /// If the deleted set was the one in use, switch to another so presenting never opens a missing file.
+    private func notesFileDeleted(_ url: URL) {
+        guard url.standardizedFileURL.path == store.url.standardizedFileURL.path else { return }
+        if let other = NotesStore.anyFile(near: url) {
+            selectFile(other)
+        }
+    }
+
+    /// Starts presenting with a set of notes: the window closes and the notes screen appears.
+    private func present(_ url: URL) {
+        if library.window.isVisible { library.close() }
+        selectFile(url)
+        visible = true
+        showingHelp = false
+        applyVisibility()
+        refresh()
+        Log.write("presenting \(url.lastPathComponent)")
+        startedPresenting()
+    }
+
+    private func stopPresenting() {
+        visible = false
+        showingHelp = false
+        applyVisibility()
+        refresh()
+        Log.write("stopped presenting")
+    }
+
+    /// Once per launch, check quietly whether screen sharing can see the notes.
+    private func startedPresenting() {
+        guard !sharingChecked else { return }
+        sharingChecked = true
+        checkSharing(announce: false)
+    }
+
+    /// Opening the app again while it is running brings up the notes window.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        openLibrary()
+        return false
+    }
+
+    /// Menus for when the notes window is in front. They also make Cmd+C, Cmd+V and the rest work.
+    private func buildMainMenu() {
+        let main = NSMenu()
+        func add(_ title: String, _ items: [NSMenuItem]) {
+            let menu = NSMenu(title: title)
+            items.forEach(menu.addItem)
+            let top = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            top.submenu = menu
+            main.addItem(top)
+        }
+        func standard(_ title: String, _ action: Selector, _ key: String, shift: Bool = false) -> NSMenuItem {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+            if shift { item.keyEquivalentModifierMask = [.command, .shift] }
+            return item
+        }
+        add("Presenter Notes", [
+            ClosureMenuItem(title: "Hide Presenter Notes", key: "h") { NSApp.hide(nil) },
+            .separator(),
+            ClosureMenuItem(title: "Quit Presenter Notes", key: "q") { NSApp.terminate(nil) },
+        ])
+        add("File", [
+            ClosureMenuItem(title: "New Set of Notes", key: "n") { [unowned self] in library.newSet() },
+            ClosureMenuItem(title: "Save", key: "s") { [unowned self] in library.saveIfNeeded() },
+            standard("Close Window", #selector(NSWindow.performClose(_:)), "w"),
+        ])
+        add("Edit", [
+            standard("Undo", Selector(("undo:")), "z"),
+            standard("Redo", Selector(("redo:")), "z", shift: true),
+            .separator(),
+            standard("Cut", #selector(NSText.cut(_:)), "x"),
+            standard("Copy", #selector(NSText.copy(_:)), "c"),
+            standard("Paste", #selector(NSText.paste(_:)), "v"),
+            standard("Select All", #selector(NSText.selectAll(_:)), "a"),
+        ])
+        add("View", [
+            ClosureMenuItem(title: "Bigger Text", key: "=") { [unowned self] in library.biggerText() },
+            ClosureMenuItem(title: "Smaller Text", key: "-") { [unowned self] in library.smallerText() },
+        ])
+        add("Present", [
+            ClosureMenuItem(title: "Present These Notes", key: "\r") { [unowned self] in library.present() },
+            ClosureMenuItem(title: "Add a Note for the Slide on Screen", key: "l") { [unowned self] in library.addNoteForSlide() },
+        ])
+        NSApp.mainMenu = main
+    }
+
+    /// Every notes file in the notes folder and in the folder of the file in use, by name.
+    private func notesFiles() -> [URL] {
+        let folders = Set([NotesStore.defaultURL.deletingLastPathComponent().standardizedFileURL,
+                           store.url.deletingLastPathComponent().standardizedFileURL])
+        var files = folders.flatMap {
+            (try? FileManager.default.contentsOfDirectory(at: $0, includingPropertiesForKeys: nil)) ?? []
+        }.filter { $0.pathExtension.lowercased() == "txt" }
+        if !files.contains(where: { $0.standardizedFileURL.path == store.url.standardizedFileURL.path }) {
+            files.append(store.url)
+        }
+        return files.sorted { $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending }
+    }
+
+    /// Switches to another notes file, from the menu or the file chooser.
+    private func selectFile(_ url: URL) {
+        store.use(url)
+        pageIndex = 0
+        view.scrollOffset = 0
+        noNoteForSlide = false
+        stepsSinceSlideSeen = 0
+        follower.forget() // if this file belongs to the deck on screen, jump to the slide showing
+        Log.write("notes file chosen: \(url.lastPathComponent), \(store.pages.count) notes")
+        refresh()
+        view.flash("Notes: \(url.deletingPathExtension().lastPathComponent)")
     }
 
     // MARK: Actions
@@ -902,8 +1711,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Log.write("mouse control switched off")
             if announce {
                 // A full message, not a brief flash: on and off share one shortcut and are easy to mix up.
-                message = ("Mouse control is OFF.\n\nPress Ctrl+Opt+K to switch it on again.", AppDelegate.warningColour)
-                refresh()
+                showBriefly("Mouse control is OFF.\n\nPress Ctrl+Opt+K to switch it on again.",
+                            colour: AppDelegate.warningColour, seconds: 4)
             }
             return
         }
@@ -922,8 +1731,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Settings.mouseControl = true
         Log.write("mouse control is on")
         if announce {
-            message = ("Mouse control is ON.\n\nIn a full-screen slideshow: left click goes forward, right click goes back, the wheel scrolls your notes.", AppDelegate.okColour)
-            refresh()
+            showBriefly("Mouse control is ON.\n\nIn a full-screen slideshow: left click goes forward, right click goes back, the wheel scrolls your notes.",
+                        colour: AppDelegate.okColour, seconds: 4)
         }
     }
 
@@ -932,7 +1741,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Returns nil when the mouse applies, or the reason it does not.
     private func mouseBlockedReason(at point: CGPoint?, wheel: Bool = false) -> String? {
         guard visible else { return "notes are hidden" }
-        guard message == nil else { return "a message is on screen" }
         guard let front = NSWorkspace.shared.frontmostApplication, let bundleID = front.bundleIdentifier,
               let browser = SlideFollower.browsers[bundleID] else {
             return "\(NSWorkspace.shared.frontmostApplication?.localizedName ?? "another app") is in front, not a browser"
@@ -1060,6 +1868,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         { [unowned self] point, wheel in
             let reason = mouseBlockedReason(at: point, wheel: wheel)
             if let reason { Log.throttled("mouse-blocked", every: 3, "mouse left alone: \(reason)") }
+            if reason == nil, message != nil {
+                // A click or scroll on the slideshow clears a message and then counts as normal.
+                message = nil
+                refresh()
+            }
             return reason == nil
         }
     }
@@ -1080,12 +1893,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else if !MouseControl.shared.isRunning {
             lines.append("Mouse control: on, but not allowed by macOS")
         } else {
-            message = nil // the reason below should not be "a message is on screen"
             lines.append("Mouse control: on. " + (mouseBlockedReason(at: nil).map { "Waiting: \($0)" } ?? "Ready"))
         }
         Log.write("status: " + lines.joined(separator: " | "))
-        message = (lines.joined(separator: "\n\n"), .white)
-        refresh()
+        showBriefly(lines.joined(separator: "\n\n"), colour: .white, seconds: 20)
     }
 
     private func wireMouse() {
@@ -1102,9 +1913,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Shows the note linked to the slide the browser is showing.
     private func show(_ position: SlideFollower.Position) {
         lastPosition = position
+        let deckChanged = position.deckID != lastDeckSeen
+        lastDeckSeen = position.deckID
         if position.deckID != store.deckID {
-            if let file = store.file(forDeck: position.deckID) {
+            // Open this deck's notes by themselves, but only when the deck in the browser has
+            // just changed. A file picked by hand stays until a different deck comes up.
+            if deckChanged, let file = store.file(forDeck: position.deckID) {
                 store.use(file)
+                Log.write("opened \(file.lastPathComponent) for the deck on screen")
                 view.flash("Notes: \(file.deletingPathExtension().lastPathComponent)")
             } else if store.deckID != nil {
                 return // these notes belong to a different deck
@@ -1150,16 +1966,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         open.canChooseDirectories = false
         open.allowsMultipleSelection = false
         NSApp.activate(ignoringOtherApps: true)
-        if open.runModal() == .OK, let url = open.url {
-            store.use(url)
-            pageIndex = 0
-            view.scrollOffset = 0
-            noNoteForSlide = false
-            follower.forget()
-        }
+        let chosen = open.runModal() == .OK ? open.url : nil
         visible = wasVisible
         applyVisibility()
-        refresh()
+        if let chosen { selectFile(chosen) } else { refresh() }
     }
 
     @objc private func screensChanged() { refresh() }
@@ -1370,6 +2180,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             print("\(applies == expected ? "ok  " : "FAIL") \(name): mouse \(applies ? "drives the slideshow" : "left alone")")
         }
         MouseControl.shared.isActive = realActive; MouseControl.shared.sendKey = realSendKey
+        // Menu bar: what it lists, and that a file picked by hand stays put.
+        menuNeedsUpdate(statusItem.menu!)
+        print("menu: " + statusItem.menu!.items.map { item -> String in
+            if item.isSeparatorItem { return "|" }
+            return (item.state == .on ? "[x] " : "") + item.title.trimmingCharacters(in: .whitespaces)
+                + (item.isEnabled ? "" : " (label)") + (item.submenu.map { " > \($0.items.count) sizes" } ?? "")
+        }.joined(separator: " ; "))
+        func current() -> String { store.url.deletingPathExtension().lastPathComponent }
+        let deckOne = "https://docs.google.com/presentation/d/DECK-one_1/edit#slide=id.g3abc"
+        follower.forget(); follower.ingest(addresses: [deckOne])
+        print("deck one in the browser: notes file \(current())")
+        selectFile(other)
+        follower.ingest(addresses: [deckOne])
+        print("picked other-deck by hand, deck one still showing: notes file \(current()) (should stay other-deck)")
+        follower.ingest(addresses: ["https://docs.google.com/presentation/d/DECK-two/edit#slide=id.p"])
+        follower.ingest(addresses: [deckOne])
+        print("browser moved to deck two and back to deck one: notes file \(current()), note \(pageIndex + 1) (should be demo-deck, note 3)")
+        // The notes window, pointed at the test folder.
+        let testLibrary = LibraryWindowController(folder: URL(fileURLWithPath: folder))
+        testLibrary.slideOnScreen = { SlideFollower.Position(deckID: "DECK-one_1", slideID: "gNEW9") }
+        testLibrary.show(selecting: demo)
+        testLibrary.window.layoutIfNeeded()
+        if let content = testLibrary.window.contentView, let bitmap = content.bitmapImageRepForCachingDisplay(in: content.bounds) {
+            content.cacheDisplay(in: content.bounds, to: bitmap)
+            try? bitmap.representation(using: .png, properties: [:])?
+                .write(to: URL(fileURLWithPath: folder).appendingPathComponent("library.png"))
+        }
+        let demoText = (try? String(contentsOf: demo, encoding: .utf8)) ?? ""
+        func tail(_ text: String) -> String { text.suffix(60).replacingOccurrences(of: "\n", with: " / ") }
+        let added = NotesEditing.addNote(to: demoText, deckID: "DECK-one_1", slideID: "gNEW9")
+        print("editor, new slide: \(added.status) | ends: \(tail(added.text)) | cursor at end: \(added.cursor == (added.text as NSString).length)")
+        let existing = NotesEditing.addNote(to: demoText, deckID: "DECK-one_1", slideID: "g3abc")
+        print("editor, slide that has a note: \(existing.status) | text unchanged: \(existing.text == demoText) | cursor found: \(existing.cursor != nil)")
+        let wrongDeck = NotesEditing.addNote(to: demoText, deckID: "DECK-other", slideID: "gNEW9")
+        print("editor, different deck: \(wrongDeck.status) | text unchanged: \(wrongDeck.text == demoText)")
+        print("editor, empty set: \(NotesEditing.addNote(to: "", deckID: "D1", slideID: "p").text.replacingOccurrences(of: "\n", with: " / "))")
+        print("editor, unlinked notes: \(NotesEditing.addNote(to: "First\n---\nSecond", deckID: "D1", slideID: "p").text.replacingOccurrences(of: "\n", with: " / "))")
+        print("summaries: \(NotesEditing.summary(of: demoText)) | \(NotesEditing.summary(of: "First\n---\nSecond")) | \(NotesEditing.summary(of: added.text))")
+        let created = testLibrary.createSet(named: "My talk: part 1/2")
+        let again = testLibrary.createSet(named: "My talk: part 1/2")
+        print("new sets: \(created?.lastPathComponent ?? "FAILED") and \(again?.lastPathComponent ?? "FAILED") | starts: \(tail((try? String(contentsOf: created!, encoding: .utf8)) ?? ""))")
+        testLibrary.select(demo)
+        testLibrary.addNoteForSlide()
+        testLibrary.saveIfNeeded()
+        print("button, add note for slide: saved file ends: \(tail((try? String(contentsOf: demo, encoding: .utf8)) ?? ""))")
+        print("sets listed in the window: \(testLibrary.files.map { $0.deletingPathExtension().lastPathComponent })")
+        testLibrary.close()
+        store.use(again!, remember: false)
+        try? FileManager.default.removeItem(at: again!)
+        notesFileDeleted(again!)
+        print("set in use was deleted: now using \(store.url.lastPathComponent) (should be another set in the test folder)")
+
         store.use(realNotes, remember: false)
         Settings.notesPath = savedPath
         pageIndex = savedPage; Settings.pageIndex = savedPage
@@ -1379,6 +2241,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let compiled = script?.compileAndReturnError(&error) ?? false
             print("script for \(browser.name): \(compiled ? "compiles" : "FAILED \(error ?? [:])")")
         }
+        Settings.pageIndex = savedPage // leave the user's place in their notes as it was
         NSApp.terminate(nil)
     }
 

@@ -9,7 +9,8 @@ I am visually impaired and could not read the speaker notes that slideshow tools
 - Shows one note per slide in large, bold, high-contrast text on a black screen.
 - Follows Google Slides. When the slide changes, the note for that slide appears. This works in the editor, in a slideshow, and when you jump to any slide.
 - Lets you drive the slideshow with the mouse. Left click goes forward, right click goes back, and the wheel scrolls a long note.
-- Runs from keyboard shortcuts. It has no Dock icon and never takes keyboard focus from your slides.
+- Runs from keyboard shortcuts and a menu bar item. It has no Dock icon and never takes keyboard focus from your slides.
+- Keeps several sets of notes, one per slideshow, with a large-print editor to create and change them.
 - Reloads the notes file when you save it.
 
 ## Requirements
@@ -29,6 +30,19 @@ open "build/Presenter Notes.app"
 The build script signs the app with an Apple Development identity if your keychain has one. macOS then remembers the app's permissions between builds. Without one it signs ad hoc, and macOS asks for the permissions again after each build.
 
 The first time it runs, the app creates `~/PresenterNotes/notes.txt` with a short sample.
+
+## The notes window and Present
+
+Opening the app shows the notes window. The app stays running in the menu bar when you close it.
+
+- **Your sets of notes** are listed on the left. Each set is one file in `~/PresenterNotes`, usually one per slideshow.
+- **The editor** on the right shows the selected set in large text. Changes save as you type.
+- **New set** asks for a name and creates a set. If a Google Slides deck is showing in your browser, the new set is linked to it.
+- **Add a note for the slide on screen** adds a note tied to the slide showing in your browser, or moves to that slide's note if it has one.
+- **Delete** moves the set to the Trash.
+- **Present** closes the window and shows the notes screen with that set.
+
+To stop presenting, press Ctrl+Opt+N or choose Stop presenting from the menu bar. To get the window back, choose Edit notes from the menu bar, press Ctrl+Opt+E, or open the app again.
 
 ## Permissions macOS will ask for
 
@@ -80,7 +94,7 @@ It needs the Google Slides connector in Claude. The helper script, `notes_tool.p
 
 | Shortcut | What it does |
 |---|---|
-| Ctrl+Opt+N | Show or hide notes |
+| Ctrl+Opt+N | Start or stop presenting |
 | Ctrl+Opt+Right / Left | Next or previous note |
 | Ctrl+Opt+0 | Back to the first note |
 | Ctrl+Opt+Down / Up | Scroll a long note |
@@ -88,7 +102,7 @@ It needs the Google Slides connector in Claude. The helper script, `notes_tool.p
 | Ctrl+Opt+C | Change text colour |
 | Ctrl+Opt+L | Change layout: full screen, top half, bottom half |
 | Ctrl+Opt+M | Move the notes to the next display |
-| Ctrl+Opt+E | Edit the notes file |
+| Ctrl+Opt+E | Edit notes in the notes window |
 | Ctrl+Opt+O | Open another notes file |
 | Ctrl+Opt+F | Follow slides on or off |
 | Ctrl+Opt+K | Mouse control on or off |
@@ -96,6 +110,21 @@ It needs the Google Slides connector in Claude. The helper script, `notes_tool.p
 | Ctrl+Opt+T | Check notes are hidden from screen sharing |
 | Ctrl+Opt+H | Show or hide help |
 | Ctrl+Opt+Shift+Q | Quit |
+
+## Menu bar
+
+The app adds a **Notes** item to the menu bar. Its menu uses larger text than a normal menu and offers:
+
+- Present or stop presenting, and open the notes window.
+- Bigger text, smaller text, or a text size picked from a list.
+- Mouse control on or off, and slide following on or off. A tick shows which are on.
+- Every notes file in `~/PresenterNotes`, with a tick on the one in use. Choose one to switch slideshows.
+- Choose another file, or open the notes folder.
+- Quit.
+
+The notes window sits just under the menu bar, so the menu stays reachable on the screen that shows the notes.
+
+A notes file with a `deck:` line opens by itself when that deck comes up in the browser. A file you pick by hand stays in use until a different deck comes up.
 
 ## Mouse control
 
