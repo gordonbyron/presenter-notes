@@ -124,3 +124,7 @@ This runs the built-in checks, prints the results, writes a picture of each scre
 ## Code
 
 The whole app is one Swift file, [Sources/main.swift](Sources/main.swift), using AppKit with no dependencies.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).
