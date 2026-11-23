@@ -64,6 +64,18 @@ To find a slide's ID, select the slide in Google Slides and look at the end of t
 
 A note can be longer than one screen. Scroll it with the wheel or with Ctrl+Opt+Down.
 
+## Writing notes with Claude
+
+The [skill/presenter-notes](skill/presenter-notes) folder holds a skill for Claude Code. Give Claude a Google Slides link and ask for presenter notes. It reads the deck's speaker notes, writes a notes file with one note per slide and the `slide:` lines filled in, and checks the file against the deck. It writes short keyword notes by default, or the speaker notes word for word if you ask for "full".
+
+To install it, copy the folder into your Claude skills folder:
+
+```sh
+cp -R skill/presenter-notes ~/.claude/skills/
+```
+
+It needs the Google Slides connector in Claude. The helper script, `notes_tool.py`, uses only the Python standard library and can also be run by hand. Run it with `--help` to see how.
+
 ## Shortcuts
 
 | Shortcut | What it does |
